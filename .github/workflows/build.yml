@@ -55,23 +55,19 @@ jobs:
           nproc; free -h; df -h /
 
       - name: Fetch Blender source
-        env:
-          GIT_LFS_SKIP_SMUDGE: '1'
         run: |
-          git clone --depth 1 --branch "${{ inputs.blender_ref || 'v5.2.3' }}" \
-            https://github.com/blender/blender.git blender
-          git -C blender log -1 --format='%H %s'
-          git -C blender config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-
-      - name: Pull Blender LFS files
-        run: |
-          git -C blender lfs pull \
-            -I "release/datafiles/**" -I "assets/**" \
-            -I "scripts/startup/bl_app_templates_system/**"
-          git -C blender lfs checkout
+          REF="${{ inputs.blender_ref || 'v5.2.3' }}"
+          # Official source snapshot: all Git LFS files are already materialized
+          # (release/datafiles, assets, app templates), so no LFS checkout is needed.
+          curl -fsSL -o blender.tar.xz "https://download.blender.org/source/blender-${REF#v}.tar.xz"
+          mkdir blender
+          tar -xJf blender.tar.xz -C blender --strip-components=1
+          rm -f blender.tar.xz
           head -c 7 blender/release/datafiles/startup.blend; echo
           test "$(head -c 7 blender/release/datafiles/startup.blend)" = "BLENDER" \
-            || { echo "ERROR: startup.blend is still a Git LFS pointer"; exit 1; }
+            || { echo "ERROR: startup.blend looks like a Git LFS pointer"; exit 1; }
+          grep -E "define BLENDER_VERSION(_PATCH)? " \
+            blender/source/blender/blenkernel/BKE_blender_version.h
           du -sh blender
 
       - name: Fetch precompiled libraries
@@ -98,10 +94,12 @@ jobs:
           shopt -s nullglob
           for p in patches/*.patch; do
             echo "Applying $p"
-            git -C blender apply --verbose "$GITHUB_WORKSPACE/$p"
+            patch -p1 -d blender --batch < "$GITHUB_WORKSPACE/$p"
           done
-          git -C blender status --short
-          git -C blender diff --stat
+          grep -n "GPU_storagebuf_clear(render_map_buf_" \
+            blender/source/blender/draw/engines/eevee/eevee_shadow.cc
+          grep -n "Only merge barriers of the same subresources" \
+            blender/source/blender/gpu/vulkan/render_graph/vk_command_builder.cc
 
       - name: Configure
         run: |
