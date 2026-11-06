@@ -63,9 +63,11 @@ jobs:
           mkdir blender
           tar -xJf blender.tar.xz -C blender --strip-components=1
           rm -f blender.tar.xz
-          head -c 7 blender/release/datafiles/startup.blend; echo
-          test "$(head -c 7 blender/release/datafiles/startup.blend)" = "BLENDER" \
-            || { echo "ERROR: startup.blend looks like a Git LFS pointer"; exit 1; }
+          head -c 7 blender/release/datafiles/startup.blend | xxd | head -1
+          test "$(head -c 7 blender/release/datafiles/startup.blend)" != "version" \
+            || { echo "ERROR: startup.blend is a Git LFS pointer"; exit 1; }
+          test "$(stat -c%s blender/release/datafiles/startup.blend)" -gt 10000 \
+            || { echo "ERROR: startup.blend is too small"; exit 1; }
           grep -E "define BLENDER_VERSION(_PATCH)? " \
             blender/source/blender/blenkernel/BKE_blender_version.h
           du -sh blender
