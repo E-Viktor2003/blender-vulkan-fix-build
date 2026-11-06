@@ -1,0 +1,298 @@
+From 5cb3eb22da64e0ae9895a2270e91dae9c0c0cced Mon Sep 17 00:00:00 2001
+From: Viktor <viktor@localhost>
+Date: Fri, 6 Nov 2026 11:57:18 +0500
+Subject: [PATCH] Fix: Vulkan/Eevee shadow flicker backports for 5.2.3
+
+Backport of the upstream fixes that are candidates for the reported
+flickering/black surfaces in EEVEE with the Vulkan backend while moving
+the camera:
+
+- 05caad5ac73 Fix: Vulkan: Missing layout transitions of layered attachments
+  add_image_barrier() merged barriers by image handle only, so only the
+  first subresource (layer/mip) of a layered attachment (e.g. the shadow
+  atlas) was transitioned back out of the rendering layout, leaving the
+  other layers with stale contents.
+
+- c394b602b67 EEVEE: Shadow: Clear rendermap to invalid pages
+  The render map was only partially written each update; entries for
+  tiles that are not rendered kept garbage page indices, which the
+  surface shadow shader sampled.
+
+- 14ea6ab71f7 EEVEE: Shadow: Speedup render by not tagging usage for each
+  update loop (only reset SHADOW_IS_USED once per render loop).
+
+All three applied without conflicts.
+---
+ .../draw/engines/eevee/eevee_shadow.cc        |  8 +++-
+ .../draw/engines/eevee/eevee_shadow.hh        |  4 ++
+ .../eevee_shadow_tilemap_finalize.bsl.hh      | 14 +++---
+ .../shaders/eevee_shadow_tilemap_init.bsl.hh  | 32 +++++++------
+ source/blender/draw/tests/eevee_test.cc       | 45 ++++++++++---------
+ .../vulkan/render_graph/vk_command_builder.cc | 12 +++--
+ 6 files changed, 67 insertions(+), 48 deletions(-)
+
+diff --git a/source/blender/draw/engines/eevee/eevee_shadow.cc b/source/blender/draw/engines/eevee/eevee_shadow.cc
+index 1d3ad1499f0..ae86b2e6db2 100644
+--- a/source/blender/draw/engines/eevee/eevee_shadow.cc
++++ b/source/blender/draw/engines/eevee/eevee_shadow.cc
+@@ -912,6 +912,7 @@ void ShadowModule::end_sync()
+         /* Clear usage bits. Tag update from the tile-map for sun shadow clip-maps shifting. */
+         PassSimple::Sub &sub = pass.sub("Init");
+         sub.shader_set(inst_.shaders.static_shader_get(SHADOW_TILEMAP_INIT));
++        sub.push_constant("reset_used_flag", &run_tagging_);
+         sub.bind_ssbo("tilemaps_buf", tilemap_pool.tilemaps_data);
+         sub.bind_ssbo("tilemaps_clip_buf", tilemap_pool.tilemaps_clip);
+         sub.bind_ssbo("tiles_buf", tilemap_pool.tiles_data);
+@@ -1325,19 +1326,22 @@ void ShadowModule::render(View &view, int2 extent)
+     GPU_debug_group_begin("Shadow");
+     {
+       GPU_uniformbuf_clear_to_zero(shadow_multi_view_.matrices_ubo_get());
++      GPU_storagebuf_clear(render_map_buf_, 0xFFFFFFFFu);
++
++      run_tagging_ = (loop_count == 0);
+ 
+       inst_.manager->submit(tilemap_setup_ps_, view);
+       if (loop_count == 0) {
+         if (assign_if_different(update_casters_, false)) {
+           /* Run caster update only once. */
+-          /* TODO(fclem): There is an optimization opportunity here where we can
++          /* TODO(fclem): There is an  optimization opportunity here where we can
+            * test casters only against the static tile-maps instead of all of them. */
+           inst_.manager->submit(caster_update_ps_, view);
+         }
+         inst_.manager->submit(jittered_transparent_caster_update_ps_, view);
+         inst_.manager->submit(update_propagate_ps_, view);
++        inst_.manager->submit(tilemap_usage_ps_, view);
+       }
+-      inst_.manager->submit(tilemap_usage_ps_, view);
+       inst_.manager->submit(tilemap_update_ps_, view);
+ 
+       shadow_multi_view_.compute_procedural_bounds();
+diff --git a/source/blender/draw/engines/eevee/eevee_shadow.hh b/source/blender/draw/engines/eevee/eevee_shadow.hh
+index 2697b4a688f..22fd8fd6a75 100644
+--- a/source/blender/draw/engines/eevee/eevee_shadow.hh
++++ b/source/blender/draw/engines/eevee/eevee_shadow.hh
+@@ -203,6 +203,10 @@ class ShadowModule {
+   /* Used to call caster_update_ps_ only once per sync (Initialized on begin_sync). */
+   bool update_casters_ = false;
+ 
++  /* When rendering shadows in a loop, we only tag for usage once and setup multiple times.
++   * In this case `run_tagging_` is set to false after the first iteration. */
++  bool32_t run_tagging_ = false;
++
+   /* -------------------------------------------------------------------- */
+   /** \name Tile-map Management
+    * \{ */
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_shadow_tilemap_finalize.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_shadow_tilemap_finalize.bsl.hh
+index b9e97399931..53f077c57ca 100644
+--- a/source/blender/draw/engines/eevee/shaders/eevee_shadow_tilemap_finalize.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_shadow_tilemap_finalize.bsl.hh
+@@ -250,13 +250,11 @@ void rendermap_finalize_main([[resource_table]] RendermapFinalize &srt,
+     int lod_res = SHADOW_TILEMAP_RES >> lod;
+     int2 relative_tile_co = (viewport_tile_co + lod_res) % lod_res;
+     if (all(lessThan(relative_tile_co, viewport_size))) {
+-      bool do_page_render = tile.is_used && tile.do_update;
+-      uint page_packed = shadow_page_pack(tile.page);
+-      /* Add page to render map. */
+-      int render_page_index = shadow_render_page_index_get(view_index, relative_tile_co);
+-      srt.render_map_buf[render_page_index] = do_page_render ? page_packed : 0xFFFFFFFFu;
+-
+-      if (do_page_render) {
++      if (tile.is_used && tile.do_update) {
++        uint page_packed = shadow_page_pack(tile.page);
++        /* Add page to render map. */
++        int render_page_index = shadow_render_page_index_get(view_index, relative_tile_co);
++        srt.render_map_buf[render_page_index] = page_packed;
+         /* Add page to clear dispatch. */
+         uint page_index = atomicAdd(srt.clear_dispatch_buf.num_groups_z, 1u);
+         /* Add page to tile processing. */
+@@ -264,7 +262,7 @@ void rendermap_finalize_main([[resource_table]] RendermapFinalize &srt,
+         /* Add page mapping for indexing the page position in atlas and in the frame-buffer. */
+         srt.dst_coord_buf[page_index] = page_packed;
+         srt.src_coord_buf[page_index] = packUvec4x8(
+-            uint4(int4(relative_tile_co.x, relative_tile_co.y, view_index, 0)));
++            uint4(relative_tile_co.x, relative_tile_co.y, view_index, 0));
+         /* Tag tile as rendered. Should be safe since only one thread is reading and writing. */
+         srt.tiles_buf[tile_index] |= SHADOW_IS_RENDERED;
+         /* Statistics. */
+diff --git a/source/blender/draw/engines/eevee/shaders/eevee_shadow_tilemap_init.bsl.hh b/source/blender/draw/engines/eevee/shaders/eevee_shadow_tilemap_init.bsl.hh
+index 0101fa9b3ea..75631f36f9c 100644
+--- a/source/blender/draw/engines/eevee/shaders/eevee_shadow_tilemap_init.bsl.hh
++++ b/source/blender/draw/engines/eevee/shaders/eevee_shadow_tilemap_init.bsl.hh
+@@ -19,25 +19,31 @@
+ 
+ namespace eevee::shadow {
+ 
+-ShadowTileDataPacked init_tile_data(ShadowTileDataPacked tile, bool do_update)
+-{
+-  if (flag_test(tile, SHADOW_IS_RENDERED)) {
+-    tile &= ~(SHADOW_DO_UPDATE | SHADOW_IS_RENDERED);
+-  }
+-  if (do_update) {
+-    tile |= SHADOW_DO_UPDATE;
+-  }
+-  tile &= ~SHADOW_IS_USED;
+-  return tile;
+-}
+-
+ struct TilemapInit {
+   [[storage(0, read_write)]] ShadowTileMapData (&tilemaps_buf)[];
+   [[storage(1, read_write)]] uint (&tiles_buf)[];
+   [[storage(2, read_write)]] ShadowTileMapClip (&tilemaps_clip_buf)[];
+   [[storage(4, read_write)]] uint2 (&pages_cached_buf)[];
+ 
++  /* When rendering shadows in a loop, we only tag for usage once and setup multiple times.
++   * In this case `reset_used_flag` is set to false after the first iteration. */
++  [[push_constant]] bool reset_used_flag;
++
+   [[shared]] int directional_range_changed;
++
++  ShadowTileDataPacked init_tile_data(ShadowTileDataPacked tile, bool do_update)
++  {
++    if (flag_test(tile, SHADOW_IS_RENDERED)) {
++      tile &= ~(SHADOW_DO_UPDATE | SHADOW_IS_RENDERED);
++    }
++    if (do_update) {
++      tile |= SHADOW_DO_UPDATE;
++    }
++    if (reset_used_flag) {
++      tile &= ~SHADOW_IS_USED;
++    }
++    return tile;
++  }
+ };
+ 
+ [[compute, local_size(SHADOW_TILEMAP_RES, SHADOW_TILEMAP_RES)]]
+@@ -108,7 +114,7 @@ void tilemap_init_main([[resource_table]] TilemapInit &srt,
+     ShadowTileDataPacked tile = 0;
+     int tile_load = shadow_tile_offset(uint2(tile_wrapped), tilemap.tiles_index, lod);
+     if (thread_active) {
+-      tile = init_tile_data(srt.tiles_buf[tile_load], do_update);
++      tile = srt.init_tile_data(srt.tiles_buf[tile_load], do_update);
+     }
+ 
+     /* Uniform control flow for barrier. Needed to avoid race condition on shifted loads. */
+diff --git a/source/blender/draw/tests/eevee_test.cc b/source/blender/draw/tests/eevee_test.cc
+index ae53d200dd2..253d6192977 100644
+--- a/source/blender/draw/tests/eevee_test.cc
++++ b/source/blender/draw/tests/eevee_test.cc
+@@ -66,6 +66,7 @@ static void test_eevee_shadow_shift_clear()
+ 
+   PassSimple pass("Test");
+   pass.shader_set(sh);
++  pass.push_constant("reset_used_flag", true);
+   pass.bind_ssbo("tilemaps_buf", tilemaps_data);
+   pass.bind_ssbo("tilemaps_clip_buf", tilemaps_clip);
+   pass.bind_ssbo("tiles_buf", tiles_data);
+@@ -887,7 +888,7 @@ static void test_eevee_shadow_finalize()
+   StorageArrayBuffer<uint, SHADOW_RENDER_MAP_SIZE> render_map_buf = {"render_map_buf"};
+   StorageArrayBuffer<uint, SHADOW_VIEW_MAX> viewport_index_buf = {"viewport_index_buf"};
+ 
+-  render_map_buf.clear_to_zero();
++  GPU_storagebuf_clear(render_map_buf, 0xFFFFFFFFu);
+   clear_dispatch_buf.clear_to_zero();
+ 
+   gpu::Shader *sh = GPU_shader_create_from_info_name("eevee_shadow_tilemap_finalize");
+@@ -996,7 +997,7 @@ static void test_eevee_shadow_finalize()
+     auto stringify_view = [](Span<uint> data) -> std::string {
+       std::string result;
+       for (auto x : data) {
+-        result += (x == 0u) ? '-' : ((x == 0xFFFFFFFFu) ? 'x' : '0' + (x % 10));
++        result += (x == 0u) ? 'x' : ((x == 0xFFFFFFFFu) ? '-' : '0' + (x % 10));
+       }
+       return result;
+     };
+@@ -1071,10 +1072,10 @@ static void test_eevee_shadow_finalize()
+         "--------------------------------";
+ 
+     StringRefNull expected_view2 =
+-        "4xxx----------------------------"
+-        "xxxx----------------------------"
+-        "8xxx----------------------------"
+-        "xxxx----------------------------"
++        "4-------------------------------"
++        "--------------------------------"
++        "8-------------------------------"
++        "--------------------------------"
+         "--------------------------------"
+         "--------------------------------"
+         "--------------------------------"
+@@ -1139,22 +1140,22 @@ static void test_eevee_shadow_finalize()
+         "--------------------------------";
+ 
+     StringRefNull expected_view4 =
+-        "xxxxxxx7xxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "xxxxxxxxxxxxxxxx----------------"
+-        "9xxxxxxxxxxxxxxx----------------"
++        "-------7------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "--------------------------------"
++        "9-------------------------------"
+         "--------------------------------"
+         "--------------------------------"
+         "--------------------------------"
+diff --git a/source/blender/gpu/vulkan/render_graph/vk_command_builder.cc b/source/blender/gpu/vulkan/render_graph/vk_command_builder.cc
+index 78e3184bc47..24839f89950 100644
+--- a/source/blender/gpu/vulkan/render_graph/vk_command_builder.cc
++++ b/source/blender/gpu/vulkan/render_graph/vk_command_builder.cc
+@@ -812,7 +812,7 @@ void VKCommandBuilder::add_image_read_barriers(VKRenderGraph &render_graph,
+                           resource_state.image_layout,
+                           link.vk_image_layout,
+                           link.vk_image_aspect,
+-                          {});
++                          link.subimage);
+       }
+       continue;
+     }
+@@ -892,7 +892,7 @@ void VKCommandBuilder::add_image_write_barriers(VKRenderGraph &render_graph,
+                           resource_state.image_layout,
+                           link.vk_image_layout,
+                           link.vk_image_aspect,
+-                          {});
++                          link.subimage);
+       }
+       continue;
+     }
+@@ -931,7 +931,13 @@ void VKCommandBuilder::add_image_barrier(VkImage vk_image,
+        vk_image_memory_barriers_.as_mutable_span().drop_front(
+            r_barrier.image_memory_barriers.start()))
+   {
+-    if (vk_image_memory_barrier.image == vk_image) {
++    /* Only merge barriers of the same subresources. Otherwise the layout transition of another
++     * layer or mip-map of the same image is lost. */
++    const VkImageSubresourceRange &range = vk_image_memory_barrier.subresourceRange;
++    if (vk_image_memory_barrier.image == vk_image && range.aspectMask == aspect_mask &&
++        range.baseMipLevel == subimage.mipmap_level && range.levelCount == subimage.mipmap_count &&
++        range.baseArrayLayer == subimage.layer_base && range.layerCount == subimage.layer_count)
++    {
+       /* When registering read/write buffers, it can be that the node internally requires
+        * read/write. In this case we adjust the dstAccessMask of the read barrier. An example is
+        * EEVEE update HIZ compute shader and shadow tagging. */
+-- 
+2.56.0
+

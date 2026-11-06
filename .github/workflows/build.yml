@@ -1,0 +1,162 @@
+name: Build Blender (Linux x64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      blender_ref:
+        description: 'Blender git ref or tag to build'
+        required: true
+        default: 'v5.2.3'
+      apply_patch:
+        description: 'Apply patches/*.patch after checkout'
+        type: boolean
+        default: true
+      lib_commit:
+        description: 'Commit of lib/linux_x64 to use'
+        required: true
+        default: 'ecbd06cf6d2a4aa6b00a61ffb479fc81b17aba08'
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      GIT_LFS_SKIP_SMUDGE: '1'
+    steps:
+      - name: Checkout build recipe
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git-lfs pkg-config patchelf \
+            libx11-dev libxext-dev libxrender-dev libxxf86vm-dev libxcursor-dev \
+            libxi-dev libxrandr-dev libxinerama-dev libxfixes-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libx11-xcb-dev libegl-dev libgl-dev libglu1-mesa-dev \
+            libwayland-dev wayland-protocols libsm-dev libice-dev \
+            mesa-vulkan-drivers
+          echo "--- cpu/mem/disk ---"
+          nproc; free -h; df -h /
+
+      - name: Fetch Blender source
+        run: |
+          git clone --depth 1 --branch "${{ inputs.blender_ref || 'v5.2.3' }}" \
+            https://github.com/blender/blender.git blender
+          git -C blender log -1 --format='%H %s'
+          git -C blender config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          git -C blender lfs pull -I "release/datafiles/**" -I "assets/**" \
+            -I "scripts/startup/bl_app_templates_system/**"
+          du -sh blender
+
+      - name: Restore precompiled libraries from cache
+        id: libs-cache
+        uses: actions/cache@v4
+        with:
+          path: blender/lib/linux_x64
+          key: blender-libs-linux-x64-${{ inputs.lib_commit || 'ecbd06cf6d2a4aa6b00a61ffb479fc81b17aba08' }}-v1
+
+      - name: Fetch precompiled libraries
+        if: steps.libs-cache.outputs.cache-hit != 'true'
+        run: |
+          LIB_COMMIT="${{ inputs.lib_commit || 'ecbd06cf6d2a4aa6b00a61ffb479fc81b17aba08' }}"
+          rm -rf blender/lib/linux_x64
+          git clone https://projects.blender.org/blender/lib-linux_x64.git blender/lib/linux_x64
+          git -C blender/lib/linux_x64 checkout "$LIB_COMMIT"
+          git -C blender/lib/linux_x64 config lfs.url \
+            https://projects.blender.org/blender/lib-linux_x64.git/info/lfs
+          git -C blender/lib/linux_x64 lfs pull
+          du -sh blender/lib/linux_x64
+          df -h /
+
+      - name: Apply patches
+        if: ${{ github.event_name == 'push' || inputs.apply_patch }}
+        run: |
+          shopt -s nullglob
+          for p in patches/*.patch; do
+            echo "Applying $p"
+            git -C blender apply --verbose "$GITHUB_WORKSPACE/$p"
+          done
+          git -C blender status --short
+          git -C blender diff --stat
+
+      - name: Configure
+        run: |
+          cmake -S blender -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PWD/install" \
+            -DWITH_INSTALL_PORTABLE=ON \
+            -DWITH_TESTS=OFF \
+            -DWITH_ASSERT_RELEASE=OFF \
+            -DWITH_CYCLES=OFF \
+            -DWITH_CYCLES_DEVICE_OPTIX=OFF \
+            -DWITH_CYCLES_OSL=OFF \
+            -DWITH_CYCLES_PATH_GUIDING=OFF \
+            -DWITH_EMBREE=OFF \
+            -DWITH_OPENIMAGEDENOISE=OFF \
+            -DWITH_USD=OFF \
+            -DWITH_ALEMBIC=OFF \
+            -DWITH_OPENVDB=OFF \
+            -DWITH_MATERIALX=OFF \
+            -DWITH_FREESTYLE=OFF \
+            -DWITH_XR_OPENXR=OFF \
+            -DWITH_AUDASPACE=OFF \
+            -DWITH_CODEC_FFMPEG=OFF \
+            -DWITH_CODEC_SNDFILE=OFF \
+            -DWITH_PULSEAUDIO=OFF \
+            -DWITH_OPENAL=OFF \
+            -DWITH_JACK=OFF \
+            -DWITH_SDL_AUDIO=OFF
+
+      - name: Build
+        run: |
+          ninja -C build -j"$(nproc)"
+          df -h /
+
+      - name: Install
+        run: |
+          ninja -C build install
+          du -sh install
+          install/blender --version || true
+
+      - name: Smoke test (Vulkan / EEVEE, software driver)
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/install/blender" -b --factory-startup \
+            --gpu-backend vulkan -E BLENDER_EEVEE \
+            -o "$RUNNER_TEMP/smoke_####" -F PNG -f 1 2>&1 | tail -40
+
+      - name: Package
+        env:
+          REF_NAME: ${{ inputs.blender_ref || 'v5.2.3' }}
+        run: |
+          NAME="blender-${REF_NAME}-linux-x64"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          tar -C install -czf "$NAME.tar.gz" .
+          ls -lh "$NAME.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-${{ inputs.blender_ref || 'v5.2.3' }}-linux-x64
+          path: ${{ env.NAME }}.tar.gz
+          compression-level: 0
+          retention-days: 30
