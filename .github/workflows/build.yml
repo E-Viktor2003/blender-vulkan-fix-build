@@ -26,8 +26,6 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
-    env:
-      GIT_LFS_SKIP_SMUDGE: '1'
     steps:
       - name: Checkout build recipe
         uses: actions/checkout@v4
@@ -35,7 +33,7 @@ jobs:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true
+          preinstalled-runtimes: true
           android: true
           dotnet: true
           haskell: true
@@ -57,32 +55,40 @@ jobs:
           nproc; free -h; df -h /
 
       - name: Fetch Blender source
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
         run: |
           git clone --depth 1 --branch "${{ inputs.blender_ref || 'v5.2.3' }}" \
             https://github.com/blender/blender.git blender
           git -C blender log -1 --format='%H %s'
           git -C blender config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
-          git -C blender lfs pull -I "release/datafiles/**" -I "assets/**" \
+
+      - name: Pull Blender LFS files
+        run: |
+          git -C blender lfs pull \
+            -I "release/datafiles/**" -I "assets/**" \
             -I "scripts/startup/bl_app_templates_system/**"
+          git -C blender lfs checkout
+          head -c 7 blender/release/datafiles/startup.blend; echo
+          test "$(head -c 7 blender/release/datafiles/startup.blend)" = "BLENDER" \
+            || { echo "ERROR: startup.blend is still a Git LFS pointer"; exit 1; }
           du -sh blender
 
-      - name: Restore precompiled libraries from cache
-        id: libs-cache
-        uses: actions/cache@v4
-        with:
-          path: blender/lib/linux_x64
-          key: blender-libs-linux-x64-${{ inputs.lib_commit || 'ecbd06cf6d2a4aa6b00a61ffb479fc81b17aba08' }}-v1
-
       - name: Fetch precompiled libraries
-        if: steps.libs-cache.outputs.cache-hit != 'true'
         run: |
           LIB_COMMIT="${{ inputs.lib_commit || 'ecbd06cf6d2a4aa6b00a61ffb479fc81b17aba08' }}"
           rm -rf blender/lib/linux_x64
-          git clone https://projects.blender.org/blender/lib-linux_x64.git blender/lib/linux_x64
+          GIT_LFS_SKIP_SMUDGE=1 git clone \
+            https://projects.blender.org/blender/lib-linux_x64.git blender/lib/linux_x64
           git -C blender/lib/linux_x64 checkout "$LIB_COMMIT"
           git -C blender/lib/linux_x64 config lfs.url \
             https://projects.blender.org/blender/lib-linux_x64.git/info/lfs
           git -C blender/lib/linux_x64 lfs pull
+          # Fail fast if any LFS pointer is left in place of a real binary.
+          TBB="blender/lib/linux_x64/tbb/lib/libtbb.so.12"
+          test -s "$TBB" || { echo "ERROR: $TBB missing"; exit 1; }
+          test "$(head -c 7 "$TBB")" != "version" \
+            || { echo "ERROR: $TBB is still a Git LFS pointer"; exit 1; }
           du -sh blender/lib/linux_x64
           df -h /
 
