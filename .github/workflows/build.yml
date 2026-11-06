@@ -46,11 +46,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build git-lfs pkg-config patchelf \
+            gcc-14 g++-14 \
             libx11-dev libxext-dev libxrender-dev libxxf86vm-dev libxcursor-dev \
             libxi-dev libxrandr-dev libxinerama-dev libxfixes-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libx11-xcb-dev libegl-dev libgl-dev libglu1-mesa-dev \
             libwayland-dev wayland-protocols libsm-dev libice-dev \
             mesa-vulkan-drivers
+          echo "--- compilers ---"
+          gcc-14 --version | head -1
           echo "--- cpu/mem/disk ---"
           nproc; free -h; df -h /
 
@@ -106,6 +109,8 @@ jobs:
       - name: Configure
         run: |
           cmake -S blender -B build -G Ninja \
+            -DCMAKE_C_COMPILER=gcc-14 \
+            -DCMAKE_CXX_COMPILER=g++-14 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PWD/install" \
             -DWITH_INSTALL_PORTABLE=ON \
